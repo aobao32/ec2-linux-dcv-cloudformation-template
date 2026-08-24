@@ -2,7 +2,7 @@
 
 本文档描述如何通过 CloudFormation 模版，一键拉起 EC2 虚拟机，机型为 G6.2xlarge，使用 L4 GPU（24GB显存）。机器内预先安装了面向3D工作站的 Nvidia Grid 图形驱动，安装了 DCV Server，并配置了剪切板单向复制、禁止截屏的安全策略。由此可使用 DCV Client 直接连接。
 
-以下为客户侧操作步骤。模版文件为 `EC2-Ubuntu-DCV-existing-vpc-security-enhanced.yaml`，默认 AMI 为 `ami-042dc8681de073ac4`，仅在 **eu-central-1（法兰克福）** 有效，其他区域必须替换该参数值。
+以下为客户侧操作步骤。模版文件为 `EC2-Ubuntu-DCV-existing-vpc-security-enhanced-updated-tag.yaml`，默认 AMI 为 `ami-042dc8681de073ac4`，仅在 **eu-central-1（法兰克福）** 有效，其他区域必须替换该参数值。
 
 ## 一、上传并创建堆栈
 
@@ -14,10 +14,10 @@
 
 ### 2、指定模版
 
-模版地址：
+模版地址：[https://github.com/aobao32/ec2-linux-dcv-cloudformation-template/blob/main/EC2-Ubuntu-DCV-existing-vpc-security-enhanced-updated-tag.yaml](https://github.com/aobao32/ec2-linux-dcv-cloudformation-template/blob/main/EC2-Ubuntu-DCV-existing-vpc-security-enhanced-updated-tag.yaml)
 
 1. Prerequisite 区域选 **Choose an existing template**。
-2. Specify template 区域选 **Upload a template file**，点 **Choose file**，选择本地的 `EC2-Ubuntu-DCV-existing-vpc-security-enhanced.yaml`。
+2. Specify template 区域选 **Upload a template file**，点 **Choose file**，选择本地的 `EC2-Ubuntu-DCV-existing-vpc-security-enhanced-updated-tag.yaml`。
 3. 点右下角 **Next**。
 
 ## 二、填写堆栈参数
