@@ -1,0 +1,725 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Security-enhanced Ubuntu 24.04 LTS GPU desktop with Amazon DCV console access
+  in an existing VPC and subnet. Installs the GNOME desktop, GDM3, AWS NVIDIA
+  GRID driver, and Amazon DCV Server. Compared with the baseline template, the
+  interactive desktop runs as the unprivileged dcvuser account, the DCV session
+  denies screenshot, clipboard-copy, file-download and printer while keeping
+  clipboard-paste and file-upload, GNOME screenshot and screen recording
+  shortcuts are locked through dconf, the web browser client is not installed so
+  that only native clients can connect, and the instance role narrows itself to
+  AmazonSSMManagedInstanceCore plus DCV licensing once the bootstrap completes.
+  This template does not install Amazon DCV Session Manager components, create
+  network infrastructure, or allocate an Elastic IP.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: EC2 configuration
+        Parameters:
+          - InstanceType
+          - LatestAmiId
+      - Label:
+          default: Network configuration
+        Parameters:
+          - VpcId
+          - SubnetId
+      - Label:
+          default: Remote access
+        Parameters:
+          - IngressIpv4
+      - Label:
+          default: Storage and driver
+        Parameters:
+          - VolumeSize
+          - NvidiaGridDriverPrefix
+    ParameterLabels:
+      InstanceType:
+        default: G6-family instance type
+      LatestAmiId:
+        default: Canonical Ubuntu 24.04 LTS AMI in eu-central-1
+      VpcId:
+        default: Existing VPC
+      SubnetId:
+        default: Existing subnet
+      IngressIpv4:
+        default: Allowed DCV client IPv4 CIDR
+      VolumeSize:
+        default: Root volume size (GiB)
+      NvidiaGridDriverPrefix:
+        default: AWS NVIDIA GRID driver S3 prefix
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: >-
+      Existing VPC that contains the selected subnet. VpcId and SubnetId must
+      match: the selected subnet must belong to this VPC.
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: >-
+      Existing subnet for the DCV instance. It must belong to the selected VPC
+      and provide the outbound connectivity required to download packages,
+      retrieve NVIDIA and DCV artifacts, and access required AWS APIs. Configure
+      an Internet Gateway, NAT Gateway, or other egress path as appropriate for
+      your network architecture.
+  InstanceType:
+    Type: String
+    Description: >-
+      NVIDIA L4 GPU instance. The default g6.2xlarge and the selected instance
+      type must be offered in the selected subnet's Availability Zone. G6f
+      requires an NVIDIA GRID driver and is suitable for a one-user,
+      one-console-session desktop.
+    AllowedPattern: "^(g6|g6e|g6f|gr6|gr6f)\\.[a-z0-9]+$"
+    ConstraintDescription: Specify a supported x86_64 G6, G6e, G6f, Gr6, or Gr6f instance type.
+    Default: g6.2xlarge
+  LatestAmiId:
+    Type: AWS::EC2::Image::Id
+    Description: >-
+      Canonical Ubuntu Server 24.04 LTS x86_64 gp3 AMI published in
+      eu-central-1. This AMI ID is region-specific; deploy this template in
+      eu-central-1 unless the value is overridden with an AMI from another region.
+    Default: ami-042dc8681de073ac4
+  IngressIpv4:
+    Type: String
+    Description: >-
+      Source IPv4 CIDR allowed to connect to Amazon DCV over TCP and UDP 8443.
+      The default 10.0.0.0/8 limits access to clients with a routed path from
+      the RFC 1918 10/8 private address range; restrict it further to the actual
+      office or client subnet where possible.
+    AllowedPattern: "^(?:[0-9]{1,3}\\.){3}[0-9]{1,3}/(?:[0-9]|[12][0-9]|3[0-2])$"
+    ConstraintDescription: Specify a valid IPv4 CIDR.
+    Default: 10.0.0.0/8
+  VolumeSize:
+    Type: Number
+    Description: Encrypted gp3 root volume size in GiB.
+    MinValue: 50
+    MaxValue: 16384
+    Default: 100
+  NvidiaGridDriverPrefix:
+    Type: String
+    Description: >-
+      AWS-managed S3 prefix containing the NVIDIA GRID Linux installer. G6f and
+      Gr6f require GRID 18.4 through 19.5, so this template pins GRID 19.5
+      instead of the incompatible GRID 20.x currently published under latest/.
+    AllowedPattern: "^s3://ec2-linux-nvidia-drivers/[A-Za-z0-9._/-]+/$"
+    ConstraintDescription: Specify an S3 prefix under s3://ec2-linux-nvidia-drivers/ and include a trailing slash.
+    Default: s3://ec2-linux-nvidia-drivers/grid-19.5/
+
+Resources:
+  DcvSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow direct Amazon DCV access from the configured IPv4 CIDR
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - Description: Amazon DCV web and native client over TCP
+          IpProtocol: tcp
+          FromPort: 8443
+          ToPort: 8443
+          CidrIp: !Ref IngressIpv4
+        - Description: Amazon DCV QUIC transport over UDP
+          IpProtocol: udp
+          FromPort: 8443
+          ToPort: 8443
+          CidrIp: !Ref IngressIpv4
+      SecurityGroupEgress:
+        - Description: Allow outbound IPv4 traffic for packages, licensing, and AWS APIs
+          IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-dcv-sg
+        - Key: StackName
+          Value: !Ref AWS::StackName
+
+  DcvUserSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: !Sub Amazon DCV desktop credentials for the dcvuser account in ${AWS::StackName}
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"dcvuser"}'
+        GenerateStringKey: password
+        PasswordLength: 24
+        ExcludePunctuation: true
+      Tags:
+        - Key: StackName
+          Value: !Ref AWS::StackName
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: StackName
+          Value: !Ref AWS::StackName
+
+  # Run-time permission. A DCV server on EC2 connects to this bucket
+  # periodically to validate its license, so this policy is retained after the
+  # bootstrap narrows the role. Removing it causes sessions to fail with a
+  # No license available error at the next validation or instance restart.
+  DcvLicensingPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: DcvLicensing
+      Roles:
+        - !Ref InstanceRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DcvLicenseBucketRead
+            Effect: Allow
+            Action:
+              - s3:GetObject
+            Resource: !Sub arn:${AWS::Partition}:s3:::dcv-license.${AWS::Region}/*
+
+  # Bootstrap-only permissions. Phase 2 deletes this inline policy as its last
+  # action, which is why iam:DeleteRolePolicy lives here and is scoped to this
+  # role alone. A stack update that modifies this resource recreates the policy.
+  DcvBootstrapPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: DcvBootstrap
+      Roles:
+        - !Ref InstanceRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: NvidiaGridDriverList
+            Effect: Allow
+            Action:
+              - s3:ListBucket
+            Resource: !Sub arn:${AWS::Partition}:s3:::ec2-linux-nvidia-drivers
+          - Sid: NvidiaGridDriverRead
+            Effect: Allow
+            Action:
+              - s3:GetObject
+            Resource: !Sub arn:${AWS::Partition}:s3:::ec2-linux-nvidia-drivers/*
+          - Sid: DesktopCredentialRead
+            Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+            Resource: !Ref DcvUserSecret
+          - Sid: StackSignal
+            Effect: Allow
+            Action:
+              - cloudformation:SignalResource
+            Resource: !Ref AWS::StackId
+          - Sid: SelfNarrowInstanceRole
+            Effect: Allow
+            Action:
+              - iam:DeleteRolePolicy
+            Resource: !GetAtt InstanceRole.Arn
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref InstanceRole
+
+  DcvInstance:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - DcvLicensingPolicy
+      - DcvBootstrapPolicy
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT120M
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref DcvSecurityGroup
+      EbsOptimized: true
+      Monitoring: false
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: required
+        HttpPutResponseHopLimit: 2
+        InstanceMetadataTags: enabled
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: !Ref VolumeSize
+            Encrypted: true
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64:
+          !Sub |
+            #!/bin/bash
+            set -Eeuo pipefail
+            exec > >(tee -a /var/log/dcv-bootstrap-phase1.log | logger -t dcv-bootstrap -s 2>/dev/console) 2>&1
+            export DEBIAN_FRONTEND=noninteractive
+
+            retry() {
+              local attempt max_attempts=12 delay_seconds=10
+              for attempt in $(seq 1 "$max_attempts"); do
+                if "$@"; then
+                  return 0
+                fi
+                echo "Attempt $attempt/$max_attempts failed: $*" >&2
+                sleep "$delay_seconds"
+              done
+              return 1
+            }
+
+            # NVIDIA's .run installer uses pkg-config and GLVND development
+            # metadata to place EGL vendor files. Enable i386 before refreshing
+            # APT so the matching 32-bit GLVND runtime can also be installed.
+            dpkg --add-architecture i386
+            apt-get -o Acquire::Retries=10 update
+            apt-get -o Acquire::Retries=10 install -y \
+              ca-certificates curl unzip jq gnupg gcc make dkms pkg-config \
+              libglvnd-dev dconf-cli \
+              libc6:i386 libstdc++6:i386 libglvnd0:i386 libglx0:i386 \
+              libegl1:i386 libgles2:i386 libopengl0:i386 \
+              linux-headers-$(uname -r) linux-modules-extra-$(uname -r)
+
+            # Install the AWS CLI while the EC2 cloud image is still using its
+            # original systemd-networkd configuration. The CLI is required by
+            # the error trap below to report bootstrap failures immediately.
+            retry curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip \
+              -o /tmp/awscliv2.zip
+            rm -rf /tmp/aws
+            unzip -q /tmp/awscliv2.zip -d /tmp
+            /tmp/aws/install --update
+
+            signal_stack() {
+              local status="$1"
+              local reason="$2"
+              local token instance_id
+              token=$(retry curl -fsS -X PUT \
+                http://169.254.169.254/latest/api/token \
+                -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600')
+              instance_id=$(retry curl -fsS \
+                -H "X-aws-ec2-metadata-token: $token" \
+                http://169.254.169.254/latest/meta-data/instance-id)
+              retry /usr/local/bin/aws cloudformation signal-resource \
+                --stack-name '${AWS::StackName}' \
+                --logical-resource-id DcvInstance \
+                --unique-id "$instance_id" \
+                --status "$status" \
+                --region '${AWS::Region}'
+              logger -t dcv-bootstrap "$status: $reason"
+            }
+
+            on_phase1_error() {
+              local rc=$?
+              trap - ERR
+              signal_stack FAILURE "Phase 1 failed at line $1 with exit code $rc" || true
+              exit "$rc"
+            }
+            trap 'on_phase1_error $LINENO' ERR
+
+            # ubuntu-desktop installs and enables NetworkManager. Preserve the
+            # cloud-init Netplan configuration and mask NetworkManager before
+            # package installation so it cannot take over the EC2 interface.
+            PRIMARY_INTERFACE=$(ip -o route show default | awk '{print $5; exit}')
+            test -n "$PRIMARY_INTERFACE"
+            mkdir -p /var/lib/dcv-bootstrap
+            tar -C /etc -cpf /var/lib/dcv-bootstrap/netplan-before-desktop.tar netplan
+            systemctl mask NetworkManager.service NetworkManager-wait-online.service
+            apt-get -o Acquire::Retries=10 install -y \
+              ubuntu-desktop gdm3 mesa-utils fwupd libfwupd3
+            systemctl disable --now NetworkManager.service NetworkManager-wait-online.service || true
+
+            # Desktop packages can regenerate Netplan for NetworkManager even
+            # when its service is masked. Restore the known-good cloud-init
+            # configuration, regenerate networkd units, and reacquire DHCP.
+            rm -rf /etc/netplan
+            tar -C /etc -xpf /var/lib/dcv-bootstrap/netplan-before-desktop.tar
+            cat > /etc/netplan/99-dcv-networkd.yaml <<'NETPLAN'
+            network:
+              version: 2
+              renderer: networkd
+            NETPLAN
+            netplan generate
+            systemctl enable systemd-networkd.service systemd-resolved.service
+            systemctl restart systemd-networkd.service systemd-resolved.service
+            networkctl reconfigure "$PRIMARY_INTERFACE" || true
+
+            network_ready() {
+              ip route show default | grep -q '^default ' &&
+                curl -fsS --connect-timeout 2 -X PUT \
+                  http://169.254.169.254/latest/api/token \
+                  -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' >/dev/null
+            }
+            retry network_ready
+            retry getent ahostsv4 awscli.amazonaws.com >/dev/null
+
+            # Create the unprivileged desktop account. dcvuser is deliberately
+            # left out of the sudo group so that the interactive user cannot
+            # edit /etc/dcv/, /etc/dconf/ or the DCV unit files. The ubuntu
+            # account keeps its sudo rights for maintenance through Session
+            # Manager, but its password is locked so it cannot be used to sign
+            # in to DCV, to the GNOME greeter, or through su.
+            SECRET_JSON=$(retry /usr/local/bin/aws secretsmanager get-secret-value \
+              --secret-id '${DcvUserSecret}' \
+              --region '${AWS::Region}' \
+              --query SecretString \
+              --output text)
+            DCV_PASSWORD=$(printf '%s' "$SECRET_JSON" | jq -r .password)
+            test -n "$DCV_PASSWORD"
+            id -u dcvuser >/dev/null 2>&1 || useradd \
+              --create-home \
+              --shell /bin/bash \
+              --comment 'Amazon DCV desktop user' \
+              dcvuser
+            printf 'dcvuser:%s\n' "$DCV_PASSWORD" | chpasswd
+            unset DCV_PASSWORD SECRET_JSON
+            usermod -aG video dcvuser
+            passwd --lock ubuntu
+
+            # Skip the GNOME first-login wizard for the autologin account.
+            install -d -o dcvuser -g dcvuser -m 0700 /home/dcvuser/.config
+            printf 'yes\n' > /home/dcvuser/.config/gnome-initial-setup-done
+            chown dcvuser:dcvuser /home/dcvuser/.config/gnome-initial-setup-done
+
+            cat > /etc/gdm3/custom.conf <<'GDMCONF'
+            [daemon]
+            WaylandEnable=false
+            AutomaticLoginEnable=true
+            AutomaticLogin=dcvuser
+
+            [security]
+
+            [xdmcp]
+
+            [chooser]
+
+            [debug]
+            GDMCONF
+            printf '/usr/sbin/gdm3\n' > /etc/X11/default-display-manager
+
+            mkdir -p /opt/dcv-install
+            retry curl -fsSL https://d1uj6qtbmh3dt5.cloudfront.net/NICE-GPG-KEY \
+              -o /opt/dcv-install/NICE-GPG-KEY
+            gpg --batch --import /opt/dcv-install/NICE-GPG-KEY
+            retry curl -fL https://d1uj6qtbmh3dt5.cloudfront.net/nice-dcv-ubuntu2404-x86_64.tgz \
+              -o /opt/dcv-install/nice-dcv-ubuntu2404-x86_64.tgz
+            tar -xzf /opt/dcv-install/nice-dcv-ubuntu2404-x86_64.tgz \
+              -C /opt/dcv-install
+            DCV_SERVER_DEB=$(find /opt/dcv-install -type f \
+              -name 'nice-dcv-server_*_amd64.ubuntu2404.deb' -print -quit)
+            test -n "$DCV_SERVER_DEB"
+
+            # nice-dcv-web-viewer is deliberately not installed, so TCP and UDP
+            # 8443 serve native clients only. The web browser client can only
+            # hide the screenshot control, whereas denying the screenshot
+            # permission also blocks external capture tools on the Windows and
+            # macOS native clients. The extracted .deb remains available under
+            # /opt/dcv-install for manual installation if browser access is
+            # later accepted as a residual risk.
+            retry apt-get -o Acquire::Retries=10 install -y "$DCV_SERVER_DEB"
+            systemctl disable dcvserver.service || true
+            systemctl stop dcvserver.service || true
+
+            cat > /etc/dcv/dcv.conf <<'DCVCONF'
+            [connectivity]
+            web-port=8443
+            enable-quic-frontend=true
+            quic-port=8443
+
+            [security]
+            authentication="system"
+
+            [clipboard]
+            enabled=true
+            primary-selection-copy=false
+            primary-selection-paste=false
+            max-payload-size-paste=1048576
+
+            [display/linux]
+            disable-local-console=true
+
+            [session-management]
+            create-session=true
+
+            [session-management/automatic-console-session]
+            owner="dcvuser"
+            storage-root="%home%"
+            DCVCONF
+            chmod 0644 /etc/dcv/dcv.conf
+
+            # Session authorization. deny cannot be overridden by a later
+            # statement, so the rules below also apply to the session owner.
+            # clipboard-copy is server to client and stays denied, while
+            # clipboard-paste is client to server and remains allowed, which
+            # produces one-way clipboard behaviour. file-download and printer
+            # are denied so that a screenshot taken inside the session cannot
+            # leave through DCV. screenshot requires DCV 2021.2 or later on
+            # both the server and the client.
+            cat > /etc/dcv/default.perm <<'PERM'
+            [permissions]
+            %any% deny screenshot clipboard-copy file-download printer
+            %owner% allow builtin
+            PERM
+            chmod 0644 /etc/dcv/default.perm
+
+            # Lock the GNOME screenshot and screen recording entry points for
+            # every user through the system dconf database. Files under
+            # /etc/dconf/ are root-owned, so dcvuser cannot revert them.
+            mkdir -p /etc/dconf/profile /etc/dconf/db/local.d/locks
+            cat > /etc/dconf/profile/user <<'PROFILE'
+            user-db:user
+            system-db:local
+            PROFILE
+            cat > /etc/dconf/db/local.d/00-dcv-lockdown <<'DCONF'
+            [org/gnome/desktop/lockdown]
+            disable-printing=true
+
+            [org/gnome/shell/keybindings]
+            screenshot=@as []
+            screenshot-window=@as []
+            show-screenshot-ui=@as []
+            show-screen-recording-ui=@as []
+            DCONF
+            cat > /etc/dconf/db/local.d/locks/dcv-lockdown <<'LOCKS'
+            /org/gnome/desktop/lockdown/disable-printing
+            /org/gnome/shell/keybindings/screenshot
+            /org/gnome/shell/keybindings/screenshot-window
+            /org/gnome/shell/keybindings/show-screenshot-ui
+            /org/gnome/shell/keybindings/show-screen-recording-ui
+            LOCKS
+            # org.gnome.desktop.lockdown disable-save-to-disk is intentionally
+            # not set: it removes GTK save dialogs across the whole desktop,
+            # which is disruptive for GPU workloads, and screenshot files kept
+            # on the server cannot leave the session anyway because
+            # clipboard-copy, file-download and printer are denied.
+            dconf update
+
+            cat >> /etc/modprobe.d/blacklist-nouveau.conf <<'NOUVEAU'
+            blacklist vga16fb
+            blacklist nouveau
+            blacklist rivafb
+            blacklist nvidiafb
+            blacklist rivatv
+            options nouveau modeset=0
+            NOUVEAU
+            if grep -q '^GRUB_CMDLINE_LINUX=' /etc/default/grub; then
+              sed -i 's/^GRUB_CMDLINE_LINUX=.*/GRUB_CMDLINE_LINUX="rdblacklist=nouveau modprobe.blacklist=nouveau"/' /etc/default/grub
+            else
+              printf 'GRUB_CMDLINE_LINUX="rdblacklist=nouveau modprobe.blacklist=nouveau"\n' >> /etc/default/grub
+            fi
+            update-grub
+            update-initramfs -u
+
+            cat > /usr/local/sbin/dcv-bootstrap-phase2 <<'PHASE2'
+            #!/bin/bash
+            set -Eeuo pipefail
+            exec > >(tee -a /var/log/dcv-bootstrap-phase2.log | logger -t dcv-bootstrap -s 2>/dev/console) 2>&1
+
+            retry() {
+              local attempt max_attempts=12 delay_seconds=10
+              for attempt in $(seq 1 "$max_attempts"); do
+                if "$@"; then
+                  return 0
+                fi
+                echo "Attempt $attempt/$max_attempts failed: $*" >&2
+                sleep "$delay_seconds"
+              done
+              return 1
+            }
+
+            signal_stack() {
+              local status="$1"
+              local reason="$2"
+              local token instance_id
+              token=$(retry curl -fsS -X PUT \
+                http://169.254.169.254/latest/api/token \
+                -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600')
+              instance_id=$(retry curl -fsS \
+                -H "X-aws-ec2-metadata-token: $token" \
+                http://169.254.169.254/latest/meta-data/instance-id)
+              retry /usr/local/bin/aws cloudformation signal-resource \
+                --stack-name '${AWS::StackName}' \
+                --logical-resource-id DcvInstance \
+                --unique-id "$instance_id" \
+                --status "$status" \
+                --region '${AWS::Region}'
+              logger -t dcv-bootstrap "$status: $reason"
+            }
+
+            on_error() {
+              local rc=$?
+              trap - ERR
+              signal_stack FAILURE "Phase 2 failed at line $1 with exit code $rc" || true
+              exit "$rc"
+            }
+            trap 'on_error $LINENO' ERR
+
+            mkdir -p /opt/nvidia-grid
+            retry /usr/local/bin/aws s3 cp --recursive \
+              '${NvidiaGridDriverPrefix}' /opt/nvidia-grid/
+            NVIDIA_INSTALLER=$(find /opt/nvidia-grid -type f \
+              -name 'NVIDIA-Linux-x86_64*.run' -print -quit)
+            test -n "$NVIDIA_INSTALLER"
+            chmod 0755 "$NVIDIA_INSTALLER"
+            /bin/sh "$NVIDIA_INSTALLER" --silent --dkms --no-cc-version-check
+
+            modprobe nvidia
+            nvidia-smi
+            rm -f /etc/X11/XF86Config*
+            nvidia-xconfig --preserve-busid --enable-all-gpus \
+              --allow-empty-initial-configuration
+
+            systemctl set-default graphical.target
+            systemctl enable gdm3.service
+            systemctl restart gdm3.service
+            for attempt in $(seq 1 60); do
+              if pgrep -x Xorg >/dev/null; then
+                break
+              fi
+              sleep 2
+            done
+            pgrep -x Xorg >/dev/null
+
+            systemctl enable dcvserver.service
+            systemctl restart dcvserver.service
+            for attempt in $(seq 1 60); do
+              if /usr/bin/dcv list-sessions 2>/dev/null | grep -q "console"; then
+                break
+              fi
+              sleep 2
+            done
+            /usr/bin/dcv list-sessions | grep -q "console"
+            ss -lnt | grep -q ':8443'
+
+            systemctl disable dcv-bootstrap-phase2.service
+            signal_stack SUCCESS "Ubuntu 24.04 GNOME and Amazon DCV console session are ready"
+            touch /var/lib/dcv-bootstrap-complete
+
+            # The stack resource is already signalled, so no later failure may
+            # attempt a second signal.
+            trap - ERR
+
+            # Narrow the instance role by deleting the DcvBootstrap inline
+            # policy, which also removes the iam:DeleteRolePolicy permission
+            # used by this very command. The role is left with the
+            # AmazonSSMManagedInstanceCore managed policy and the DcvLicensing
+            # inline policy, the latter being required because a DCV server on
+            # EC2 connects to dcv-license.<region> periodically to validate its
+            # license. After this point the instance can no longer read the
+            # desktop secret, download the NVIDIA driver, or signal the stack,
+            # so Phase 2 cannot be replayed without restoring the policy
+            # through a stack update.
+            retry /usr/local/bin/aws iam delete-role-policy \
+              --role-name '${InstanceRole}' \
+              --policy-name DcvBootstrap ||
+              logger -t dcv-bootstrap 'Failed to delete the DcvBootstrap inline policy'
+            logger -t dcv-bootstrap 'Instance role narrowed to SSM core and DCV licensing'
+            PHASE2
+            chmod 0750 /usr/local/sbin/dcv-bootstrap-phase2
+
+            cat > /etc/systemd/system/dcv-bootstrap-phase2.service <<'SERVICE'
+            [Unit]
+            Description=Complete NVIDIA GRID and Amazon DCV bootstrap
+            Wants=network-online.target
+            After=network-online.target
+            ConditionPathExists=!/var/lib/dcv-bootstrap-complete
+
+            [Service]
+            Type=oneshot
+            ExecStart=/usr/local/sbin/dcv-bootstrap-phase2
+            TimeoutStartSec=5400
+            RemainAfterExit=yes
+
+            [Install]
+            WantedBy=multi-user.target
+            SERVICE
+
+            systemctl daemon-reload
+            systemctl set-default multi-user.target
+            systemctl enable dcv-bootstrap-phase2.service
+            reboot
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
+        - Key: StackName
+          Value: !Ref AWS::StackName
+        - Key: OperatingSystem
+          Value: Ubuntu 24.04 LTS
+        - Key: Workload
+          Value: Amazon DCV GPU Desktop
+        - Key: SecurityProfile
+          Value: Screenshot and clipboard restricted
+
+Outputs:
+  DcvNativeClientUrl:
+    Description: >-
+      Amazon DCV native client URI using the instance private IP address. This
+      is the only supported connection method because nice-dcv-web-viewer is
+      not installed. The client must have a routed network path to the selected
+      VPC. Use the Windows or macOS native client version 2021.2 or later so
+      that denying the screenshot permission also blocks external capture tools.
+      Sign in as dcvuser with the stored password.
+    Value: !Sub dcv://dcvuser@${DcvInstance.PrivateIp}:8443
+
+  DesktopUserName:
+    Description: >-
+      Unprivileged operating system account that owns the GNOME session and the
+      Amazon DCV console session. It is not a member of the sudo group.
+    Value: dcvuser
+
+  AppliedDcvRestrictions:
+    Description: >-
+      Session permissions written to /etc/dcv/default.perm. Denied for every
+      user including the owner, then all remaining features granted to the owner.
+    Value: deny screenshot clipboard-copy file-download printer
+
+  PrivateIp:
+    Description: Private IPv4 address of the Ubuntu DCV EC2 instance.
+    Value: !GetAtt DcvInstance.PrivateIp
+
+  DcvCredentialSecretArn:
+    Description: >-
+      Secrets Manager ARN containing JSON keys username and password for the
+      dcvuser account. Read it with your own IAM identity: the instance loses
+      secretsmanager:GetSecretValue when the bootstrap narrows the role.
+    Value: !Ref DcvUserSecret
+
+  InstanceId:
+    Description: Ubuntu DCV EC2 instance ID.
+    Value: !Ref DcvInstance
+
+  InstanceRoleName:
+    Description: >-
+      Instance role name. After the bootstrap completes,
+      aws iam list-role-policies --role-name <name> must return DcvLicensing
+      only, and aws iam list-attached-role-policies --role-name <name> must
+      return AmazonSSMManagedInstanceCore only.
+    Value: !Ref InstanceRole
+
+  Ec2ConsoleUrl:
+    Description: EC2 instance console.
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/ec2/home?region=${AWS::Region}#InstanceDetails:instanceId=${DcvInstance}
+
+  AwsSystemsManagerSessionUrl:
+    Description: >-
+      AWS Systems Manager Session Manager maintenance URL, provided by the
+      AmazonSSMManagedInstanceCore managed policy. This is the only
+      administrative path into the instance, and its ssm-user account has
+      passwordless sudo, so restrict ssm:StartSession to operators through IAM.
+      This AWS management capability is unrelated to Amazon DCV Session Manager.
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/systems-manager/session-manager/${DcvInstance}
+
+  SecurityGroupId:
+    Description: Security group allowing DCV TCP and UDP 8443.
+    Value: !Ref DcvSecurityGroup
